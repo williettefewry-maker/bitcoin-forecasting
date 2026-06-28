@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -19,16 +20,34 @@ forecast_days = st.sidebar.slider("Forecast horizon (days)", 1, 30, 7)
 n_estimators = st.sidebar.slider("RF trees", 50, 500, 200, step=50)
 train_split = st.sidebar.slider("Train/test split (%)", 60, 90, 80)
 
+EXTERNAL_TICKERS = {
+    "Gold": "GC=F",
+    "S&P 500": "^GSPC",
+    "FTSE 100": "^FTSE",
+}
+
 @st.cache_data(ttl=3600)
 def fetch_data():
     end = datetime.today()
     start = end - timedelta(days=5 * 365)
-    df = yf.download("BTC-USD", start=start, end=end, auto_adjust=True)
-    df.columns = df.columns.get_level_values(0)
-    return df
 
-def engineer_features(df):
-    df = df.copy()
+    btc = yf.download("BTC-USD", start=start, end=end, auto_adjust=True)
+    btc.columns = btc.columns.get_level_values(0)
+
+    ext = {}
+    for name, ticker in EXTERNAL_TICKERS.items():
+        raw = yf.download(ticker, start=start, end=end, auto_adjust=True)
+        raw.columns = raw.columns.get_level_values(0)
+        ext[name] = raw["Close"].rename(name)
+
+    ext_df = pd.DataFrame(ext)
+    # Forward-fill market closures so BTC dates always have a value
+    ext_df = ext_df.reindex(btc.index).ffill().bfill()
+
+    return btc, ext_df
+
+def engineer_features(btc, ext_df):
+    df = btc.copy()
     close = df["Close"]
 
     # Moving averages
@@ -69,6 +88,19 @@ def engineer_features(df):
     df["day_of_week"] = df.index.dayofweek
     df["month"] = df.index.month
 
+    # --- External market features ---
+    for name in EXTERNAL_TICKERS:
+        series = ext_df[name]
+        col = name.lower().replace(" ", "_").replace("&", "and")
+        df[f"{col}_price"] = series
+        for lag in [1, 2, 5, 14]:
+            df[f"{col}_return_{lag}d"] = series.pct_change(lag)
+            df[f"{col}_lag_{lag}"] = series.shift(lag)
+        df[f"{col}_ma7"] = series.rolling(7).mean()
+        df[f"{col}_ma21"] = series.rolling(21).mean()
+        # 30-day rolling correlation with BTC
+        df[f"{col}_corr30"] = close.rolling(30).corr(series)
+
     df.dropna(inplace=True)
     return df
 
@@ -95,25 +127,22 @@ def build_and_forecast(df, forecast_days, n_estimators, train_split_pct):
     future_preds = []
     future_dates = []
 
-    temp_df = df.copy()
     for i in range(forecast_days):
         x_scaled = scaler.transform(last_row.reshape(1, -1))
         pred = model.predict(x_scaled)[0]
         future_preds.append(pred)
-        future_dates.append(temp_df.index[-1] + timedelta(days=1))
+        future_dates.append(df.index[-1] + timedelta(days=i + 1))
 
-        # Roll a synthetic next row: shift lags and update MAs naively
-        new_close = pred
         new_row = last_row.copy()
-        lag_map = {f"lag_{l}": i for i, l in enumerate([1, 2, 3, 5, 7, 14])}
-        for lag_name, col_idx in [(c, feature_cols.index(c)) for c in feature_cols if c.startswith("lag_")]:
+        for lag_name in [c for c in feature_cols if c.startswith("lag_")]:
             lag_val = int(lag_name.split("_")[1])
+            col_idx = feature_cols.index(lag_name)
             if lag_val == 1:
-                new_row[col_idx] = new_close
+                new_row[col_idx] = pred
             else:
-                prev_lag = f"lag_{lag_val - 1}"
-                if prev_lag in feature_cols:
-                    new_row[col_idx] = last_row[feature_cols.index(prev_lag)]
+                prev = f"lag_{lag_val - 1}"
+                if prev in feature_cols:
+                    new_row[col_idx] = last_row[feature_cols.index(prev)]
         last_row = new_row
 
     mae = mean_absolute_error(y_test, y_pred)
@@ -127,11 +156,11 @@ def build_and_forecast(df, forecast_days, n_estimators, train_split_pct):
     )
 
 # --- Load & process ---
-with st.spinner("Fetching 5 years of BTC-USD data..."):
-    raw = fetch_data()
+with st.spinner("Fetching BTC, Gold, S&P 500 and FTSE 100 data..."):
+    raw, ext_df = fetch_data()
 
 with st.spinner("Engineering features & training model..."):
-    df = engineer_features(raw)
+    df = engineer_features(raw, ext_df)
     test_dates, y_test, y_pred, future_dates, future_preds, mae, rmse, model, feature_cols = build_and_forecast(
         df, forecast_days, n_estimators, train_split
     )
@@ -146,44 +175,79 @@ col4.metric(f"{forecast_days}-day Forecast", f"${future_preds[-1]:,.0f}",
 
 st.divider()
 
-# --- Main chart ---
+# --- Main forecast chart ---
 fig = go.Figure()
 
 fig.add_trace(go.Scatter(
     x=df.index, y=df["Close"],
     name="Actual Price", line=dict(color="#F7931A", width=1.5)
 ))
-
 fig.add_trace(go.Scatter(
     x=list(test_dates), y=list(y_pred),
     name="Test Predictions", line=dict(color="#00BFFF", width=1.5, dash="dot")
 ))
-
 fig.add_trace(go.Scatter(
     x=future_dates, y=future_preds,
     name=f"{forecast_days}-day Forecast",
     line=dict(color="#00FF88", width=2.5),
-    mode="lines+markers",
-    marker=dict(size=5)
+    mode="lines+markers", marker=dict(size=5)
 ))
-
-# Shade forecast region
 fig.add_vrect(
     x0=future_dates[0], x1=future_dates[-1],
     fillcolor="rgba(0,255,136,0.05)", line_width=0
 )
-
 fig.update_layout(
     title="Bitcoin Price: Actual vs Predicted vs Forecast",
-    xaxis_title="Date",
-    yaxis_title="Price (USD)",
-    template="plotly_dark",
-    height=550,
+    xaxis_title="Date", yaxis_title="Price (USD)",
+    template="plotly_dark", height=550,
     legend=dict(orientation="h", yanchor="bottom", y=1.02),
     hovermode="x unified"
 )
-
 st.plotly_chart(fig, use_container_width=True)
+
+# --- External markets chart ---
+st.subheader("External Market Indicators")
+
+ext_colors = {"Gold": "#FFD700", "S&P 500": "#00BFFF", "FTSE 100": "#FF69B4"}
+norm_ext = ext_df.div(ext_df.iloc[0]) * 100
+norm_btc = (raw["Close"] / raw["Close"].iloc[0]) * 100
+
+fig_ext = go.Figure()
+fig_ext.add_trace(go.Scatter(
+    x=raw.index, y=norm_btc,
+    name="Bitcoin", line=dict(color="#F7931A", width=1.5)
+))
+for name, color in ext_colors.items():
+    fig_ext.add_trace(go.Scatter(
+        x=norm_ext.index, y=norm_ext[name],
+        name=name, line=dict(color=color, width=1.2)
+    ))
+fig_ext.update_layout(
+    title="Normalised Performance (Base = 100)",
+    xaxis_title="Date", yaxis_title="Indexed Price",
+    template="plotly_dark", height=400,
+    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    hovermode="x unified"
+)
+st.plotly_chart(fig_ext, use_container_width=True)
+
+# --- Rolling correlations ---
+st.subheader("30-Day Rolling Correlation with Bitcoin")
+corr_colors = {"Gold": "#FFD700", "S&P 500": "#00BFFF", "FTSE 100": "#FF69B4"}
+fig_corr = go.Figure()
+for name, color in corr_colors.items():
+    col = name.lower().replace(" ", "_").replace("&", "and")
+    fig_corr.add_trace(go.Scatter(
+        x=df.index, y=df[f"{col}_corr30"],
+        name=name, line=dict(color=color, width=1.2)
+    ))
+fig_corr.add_hline(y=0, line_dash="dash", line_color="white", line_width=0.5)
+fig_corr.update_layout(
+    template="plotly_dark", height=300,
+    yaxis=dict(range=[-1, 1], title="Correlation"),
+    hovermode="x unified"
+)
+st.plotly_chart(fig_corr, use_container_width=True)
 
 # --- Feature importance ---
 st.subheader("Top 15 Feature Importances")
@@ -192,7 +256,6 @@ importance_df = (
     .sort_values("importance", ascending=True)
     .tail(15)
 )
-
 fig2 = go.Figure(go.Bar(
     x=importance_df["importance"],
     y=importance_df["feature"],
@@ -202,7 +265,7 @@ fig2 = go.Figure(go.Bar(
 fig2.update_layout(template="plotly_dark", height=420, margin=dict(l=10))
 st.plotly_chart(fig2, use_container_width=True)
 
-# --- Moving average chart ---
+# --- Moving averages ---
 st.subheader("Moving Averages")
 fig3 = go.Figure()
 fig3.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Price", line=dict(color="#F7931A", width=1)))
