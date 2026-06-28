@@ -270,8 +270,37 @@ fig_corr.add_hline(y=0, line_dash="dash", line_color="white", line_width=0.5)
 fig_corr.update_layout(template="plotly_dark", height=300, yaxis=dict(range=[-1, 1], title="Correlation"), hovermode="x unified")
 st.plotly_chart(fig_corr, use_container_width=True)
 
+# --- Correlation heatmap ---
+st.subheader("Correlation Heatmap")
+price_data = pd.concat([
+    raw["Close"].rename("Bitcoin"),
+    ext_df["Gold"],
+    ext_df["S&P 500"],
+    ext_df["FTSE 100"],
+], axis=1).dropna()
+returns = price_data.pct_change().dropna()
+corr_matrix = returns.corr()
+labels = corr_matrix.columns.tolist()
+
+fig_heat = go.Figure(go.Heatmap(
+    z=corr_matrix.values,
+    x=labels, y=labels,
+    colorscale="RdBu",
+    zmid=0, zmin=-1, zmax=1,
+    text=np.round(corr_matrix.values, 2),
+    texttemplate="%{text}",
+    textfont=dict(size=14),
+    hoverongaps=False,
+))
+fig_heat.update_layout(
+    template="plotly_dark", height=420,
+    xaxis=dict(side="bottom"),
+    margin=dict(l=10, r=10, t=30, b=10),
+)
+st.plotly_chart(fig_heat, use_container_width=True)
+
 # --- Feature importance ---
-st.subheader("Top 15 Feature Importances")
+st.subheader("Top 20 Feature Importances")
 tab_rf, tab_xgb = st.tabs(["Random Forest", "XGBoost"])
 
 for tab, model, color in [(tab_rf, rf_model, "#F7931A"), (tab_xgb, xgb_model, "#FF69B4")]:
@@ -279,7 +308,7 @@ for tab, model, color in [(tab_rf, rf_model, "#F7931A"), (tab_xgb, xgb_model, "#
         imp_df = (
             pd.DataFrame({"feature": feature_cols, "importance": model.feature_importances_})
             .sort_values("importance", ascending=True)
-            .tail(15)
+            .tail(20)
         )
         fig_imp = go.Figure(go.Bar(x=imp_df["importance"], y=imp_df["feature"], orientation="h", marker_color=color))
         fig_imp.update_layout(template="plotly_dark", height=420, margin=dict(l=10))
